@@ -23,6 +23,7 @@ The Alternatives not chosen:
 - JSON, has no ability to be commented and is harder to read in general
 - terraform/opentofu, would be a great alternative but, a. not sure about terraform licensing and b. Microsoft is transitioning into the defender portal. There are no modules  yet to deploy content into Defender directly.
 - TOML, no  experience using it and from what i know  there  is no established tooling in the Detection Engineering Community.
+
 ## Consequences
 
 As i will not use the standard integration for content population(not stateful and  very  much manual work), i will be in need for custom tooling that is converting, the yet to come, standard layout of the rules into a deployable JSON.

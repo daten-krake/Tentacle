@@ -39,8 +39,8 @@ jobs:
           CHECKSUM_URL="https://github.com/daten-krake/tentacle-conv/releases/download/${TAG}/tentacle-conv_${TAG}_checksums.txt"
           curl -sL "$BIN_URL" -o /tmp/tentacle-conv.tar.gz
           curl -sL "$CHECKSUM_URL" -o /tmp/checksums.txt
-          grep linux_amd64 /tmp/checksums.txt > /tmp/expected.sha256
-          echo "  /tmp/tentacle-conv.tar.gz" | cat /tmp/expected.sha256 - | sha256sum -c
+          grep linux_amd64 /tmp/checksums.txt | sed 's|tentacle-conv_v[^_]*_linux_amd64.tar.gz|/tmp/tentacle-conv.tar.gz|' > /tmp/expected.sha256
+          sha256sum -c /tmp/expected.sha256
           tar -xzf /tmp/tentacle-conv.tar.gz -C /usr/local/bin/
           chmod +x /usr/local/bin/tentacle-conv
 

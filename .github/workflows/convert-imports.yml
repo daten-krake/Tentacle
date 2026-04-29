@@ -1,0 +1,175 @@
+name: Convert ARM Import Rules to YAML
+
+on:
+  push:
+    paths:
+      - "import/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-convert-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve latest release tag
+        id: release
+        run: |
+          TAG=$(curl -sL https://api.github.com/repos/daten-krake/tentacle-conv/releases/latest | \
+                python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify tentacle-conv binary
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          BIN_URL="https://github.com/daten-krake/tentacle-conv/releases/download/${TAG}/tentacle-conv_${TAG}_linux_amd64.tar.gz"
+          CHECKSUM_URL="https://github.com/daten-krake/tentacle-conv/releases/download/${TAG}/tentacle-conv_${TAG}_checksums.txt"
+          curl -sL "$BIN_URL" -o /tmp/tentacle-conv.tar.gz
+          curl -sL "$CHECKSUM_URL" -o /tmp/checksums.txt
+          grep linux_amd64 /tmp/checksums.txt > /tmp/expected.sha256
+          echo "  /tmp/tentacle-conv.tar.gz" | cat /tmp/expected.sha256 - | sha256sum -c
+          tar -xzf /tmp/tentacle-conv.tar.gz -C /usr/local/bin/
+          chmod +x /usr/local/bin/tentacle-conv
+
+      - name: Ensure output directories exist
+        run: |
+          mkdir -p Detections import/_conflicts
+
+      - name: Convert ARM JSON files to YAML
+        id: convert
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          succeeded=0
+          failed=0
+          skipped=0
+          quarantined=0
+          yaml_created=0
+          declare -a collision_files=()
+
+          for arm_file in import/*.json; do
+            base="${arm_file##*/}"
+            [[ "$base" == ".gitkeep" ]] && continue
+            [[ "$base" == *.manifest ]] && continue
+
+            echo "=== Processing: $arm_file ==="
+            tmpdir=$(mktemp -d)
+
+            if tentacle-conv -mode yaml -array -file "$arm_file" -outpath "$tmpdir" 2>/tmp/tconv_stderr; then
+              generated=()
+              for f in "$tmpdir"/*.yaml; do
+                [ -f "$f" ] && generated+=("$(basename "$f")")
+              done
+              if [ ${#generated[@]} -eq 0 ]; then
+                echo "::warning::Conversion produced zero YAML files for $arm_file — source kept"
+                failed=$((failed + 1))
+                rm -rf "$tmpdir"
+                continue
+              fi
+
+              # Default state to dev (ARM templates have no state field)
+              for yname in "${generated[@]}"; do
+                if grep -q '^state:' "$tmpdir/$yname"; then
+                  sed -i 's/^state:.*/state: dev/' "$tmpdir/$yname"
+                else
+                  sed -i '1s/^/state: dev\n/' "$tmpdir/$yname"
+                fi
+              done
+
+              # Phase 1: collect all generated YAML names
+              has_collision=false
+              for yname in "${generated[@]}"; do
+                if [ -f "Detections/$yname" ]; then
+                  echo "::warning::Collision detected: Detections/$yname already exists"
+                  has_collision=true
+                  collision_files+=("$yname")
+                fi
+              done
+
+              if $has_collision; then
+                # Quarantine the source file to stop retry loop
+                mv "$arm_file" "import/_conflicts/"
+                echo "  -> Quarantined to import/_conflicts/"
+                quarantined=$((quarantined + 1))
+              else
+                # No collisions — move all YAMLs and delete source
+                for yname in "${generated[@]}"; do
+                  mv "$tmpdir/$yname" "Detections/"
+                  yaml_created=$((yaml_created + 1))
+                done
+                rm -f "$arm_file"
+                succeeded=$((succeeded + 1))
+                echo "  -> Converted, source deleted"
+              fi
+            else
+              err=$(cat /tmp/tconv_stderr)
+              echo "::error::Conversion failed for $arm_file: $err"
+              failed=$((failed + 1))
+            fi
+
+            rm -rf "$tmpdir"
+          done
+
+          # Output summary for step summary
+          {
+            echo "succeeded=$succeeded"
+            echo "failed=$failed"
+            echo "skipped=$skipped"
+            echo "quarantined=$quarantined"
+            echo "yaml_created=$yaml_created"
+            echo "collision_count=${#collision_files[@]}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Build a JSON array of collision filenames for the summary step
+          if [ ${#collision_files[@]} -gt 0 ]; then
+            printf '%s\n' "${collision_files[@]}" > /tmp/collision_list.txt
+          fi
+
+      - name: Job summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## ARM Import Conversion Summary
+
+          | Metric | Count |
+          |---|---|
+          | Converted | ${{ steps.convert.outputs.succeeded }} |
+          | Failed | ${{ steps.convert.outputs.failed }} |
+          | Quarantined (collision) | ${{ steps.convert.outputs.quarantined }} |
+          | YAML files created | ${{ steps.convert.outputs.yaml_created }} |
+          EOF
+          if [ -f /tmp/collision_list.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Collision-quarantined files** (moved to \`import/_conflicts/\`):" >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r line; do
+              echo "- \`$line\`" >> "$GITHUB_STEP_SUMMARY"
+            done < /tmp/collision_list.txt
+          fi
+
+      - name: Commit and push
+        if: steps.convert.outputs.succeeded != '0' || steps.convert.outputs.quarantined != '0'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Detections/ import/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "auto: convert imported ARM rules to YAML"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi

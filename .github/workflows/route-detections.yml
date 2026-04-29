@@ -1,0 +1,126 @@
+name: Route Detections by State
+
+on:
+  push:
+    paths:
+      - "Detections/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: route-detections-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Ensure all target directories exist
+        run: |
+          mkdir -p Detections/{dev,test,flight,prod,unclassified}
+
+      - name: Route YAML files by state field
+        id: route
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+
+          moved=0
+          skipped=0
+          unclassified=0
+          declare -a moved_files=()
+          declare -a unclassified_files=()
+
+          for yaml_file in Detections/**/*.yaml; do
+            base="${yaml_file##*/}"
+            dir=$(dirname "$yaml_file")
+            dirname=$(basename "$dir")
+
+            # Skip files already in a state subdirectory
+            case "$dirname" in
+              dev|test|flight|prod|unclassified)
+                skipped=$((skipped + 1))
+                continue
+                ;;
+            esac
+
+            # Extract the state field (first occurrence, strip quotes)
+            state=$(grep -m1 '^state:' "$yaml_file" | sed 's/^state:[[:space:]]*//' | sed 's/^"//;s/"$//' | sed "s/^'//;s/'$//" || true)
+
+            target_dir="Detections/unclassified"
+            case "$state" in
+              dev|test|flight|prod)
+                target_dir="Detections/$state"
+                ;;
+              *)
+                echo "::warning::Unrecognized or missing state '$state' in $yaml_file — routing to unclassified/"
+                unclassified=$((unclassified + 1))
+                unclassified_files+=("$base")
+                ;;
+            esac
+
+            if [ "$dir" = "$target_dir" ]; then
+              skipped=$((skipped + 1))
+              continue
+            fi
+
+            mv "$yaml_file" "$target_dir/"
+            moved=$((moved + 1))
+            moved_files+=("$base -> $target_dir")
+            echo "  Moved: $base -> $target_dir"
+          done
+
+          {
+            echo "moved=$moved"
+            echo "skipped=$skipped"
+            echo "unclassified=$unclassified"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ ${#moved_files[@]} -gt 0 ]; then
+            printf '%s\n' "${moved_files[@]}" > /tmp/moved_list.txt
+          fi
+          if [ ${#unclassified_files[@]} -gt 0 ]; then
+            printf '%s\n' "${unclassified_files[@]}" > /tmp/unclassified_list.txt
+          fi
+
+      - name: Job summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Detection Routing Summary
+
+          | Metric | Count |
+          |---|---|
+          | Routed | ${{ steps.route.outputs.moved }} |
+          | Already in correct folder | ${{ steps.route.outputs.skipped }} |
+          | Routed to unclassified | ${{ steps.route.outputs.unclassified }} |
+          EOF
+          if [ -f /tmp/moved_list.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Files routed:**" >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r line; do
+              echo "- \`$line\`" >> "$GITHUB_STEP_SUMMARY"
+            done < /tmp/moved_list.txt
+          fi
+
+      - name: Commit and push
+        if: steps.route.outputs.moved != '0'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Detections/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "auto: route detections by state [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
